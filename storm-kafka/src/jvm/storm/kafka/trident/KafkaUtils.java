@@ -12,6 +12,7 @@ import com.google.common.collect.ImmutableMap;
 
 import backtype.storm.utils.Utils;
 import kafka.api.FetchRequest;
+import kafka.common.OffsetOutOfRangeException;
 import kafka.javaapi.consumer.SimpleConsumer;
 import kafka.javaapi.message.ByteBufferMessageSet;
 import kafka.message.Message;
@@ -23,29 +24,8 @@ import storm.kafka.KafkaConfig.ZkHosts;
 import storm.trident.operation.TridentCollector;
 
 public class KafkaUtils {
-    public static IBrokerReader makeBrokerReader(Map stormConf, TridentKafkaConfig conf) {
-        if(conf.hosts instanceof StaticHosts) {
-            return new StaticBrokerReader((StaticHosts) conf.hosts);
-        } else {
-            return new ZkBrokerReader(stormConf, conf.topic, (ZkHosts) conf.hosts);
-        }
-    }
-
-    public static List<GlobalPartitionId> getOrderedPartitions(Map<String, List> partitions) {
-        List<GlobalPartitionId> ret = new ArrayList();
-        for(String host: new TreeMap<String, List>(partitions).keySet()) {
-            List info = partitions.get(host);
-            long port = (Long) info.get(0);
-            long numPartitions = (Long) info.get(1);
-            HostPort hp = new HostPort(host, (int) port);
-            for(int i=0; i<numPartitions; i++) {
-                ret.add(new GlobalPartitionId(hp, i));
-            }
-        }
-        return ret;
-    }
-
-     public static Map emitPartitionBatchNew(TridentKafkaConfig config, SimpleConsumer consumer, GlobalPartitionId partition, TridentCollector collector, Map lastMeta, String topologyInstanceId, String topologyName) {
+     public static Map emitPartitionBatchNew(TridentKafkaConfig config, int partition, SimpleConsumer consumer, TransactionAttempt attempt, TridentCollector collector, Map lastMeta, String topologyInstanceId) {
+         StaticHosts hosts = (StaticHosts) config.hosts;
          long offset;
          if(lastMeta!=null) {
              String lastInstanceId = null;
@@ -65,7 +45,17 @@ public class KafkaUtils {
          }
          ByteBufferMessageSet msgs;
          try {
-            msgs = consumer.fetch(new FetchRequest(config.topic, partition.partition, offset, config.fetchSizeBytes));
+            msgs = consumer.fetch(new FetchRequest(config.topic, partition % hosts.partitionsPerHost, offset, config.fetchSizeBytes));
+            msgs.underlying().size();
+         } catch (OffsetOutOfRangeException _) {
+             long timeStamp = lastMeta.get("timeStamp")!=null? (Long) lastMeta.get("timeStamp"):0L;
+             long[] offsets = consumer.getOffsetsBefore(config.topic, partition % hosts.partitionsPerHost, timeStamp, 1);
+             if(offsets!=null && offsets.length > 0)
+                 offset = offsets[0];
+             else
+                 offset = 0L;
+
+             msgs = consumer.fetch(new FetchRequest(config.topic, partition % hosts.partitionsPerHost, offset, config.fetchSizeBytes));
          } catch(Exception e) {
              if(e instanceof ConnectException) {
                  throw new FailedFetchException(e);
@@ -89,9 +79,8 @@ public class KafkaUtils {
          return newMeta;
      }
 
-     public static void emit(TridentKafkaConfig config, TridentCollector collector, Message msg) {
-         Iterable<List<Object>> values =
-             config.scheme.deserialize(Utils.toByteArray(msg.payload()));
+     public static void emit(TridentKafkaConfig config, TransactionAttempt attempt, TridentCollector collector, Message msg) {
+         List<Object> values = config.scheme.deserialize(Utils.toByteArray(msg.payload()));
          if(values!=null) {
              for(List<Object> value: values)
                  collector.emit(value);

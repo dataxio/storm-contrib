@@ -6,6 +6,7 @@ import backtype.storm.utils.Utils;
 import com.google.common.collect.ImmutableMap;
 import java.util.*;
 import kafka.api.FetchRequest;
+import kafka.common.OffsetOutOfRangeException;
 import kafka.javaapi.consumer.SimpleConsumer;
 import kafka.javaapi.message.ByteBufferMessageSet;
 import kafka.message.MessageAndOffset;
@@ -13,9 +14,12 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import storm.kafka.KafkaSpout.EmitState;
 import storm.kafka.KafkaSpout.MessageAndRealOffset;
+import kafka.api.OffsetRequest;
+import java.io.IOException;
+import kafka.common.ErrorMapping;
 
 public class PartitionManager {
-    public static final Logger LOG = LoggerFactory.getLogger(PartitionManager.class);
+    public static final Logger LOG = Logger.getLogger(PartitionManager.class);
 
     static class KafkaMessageId {
         public GlobalPartitionId partition;
@@ -45,7 +49,7 @@ public class PartitionManager {
         _spoutConfig = spoutConfig;
         _topologyInstanceId = topologyInstanceId;
         _consumer = connections.register(id.host, id.partition);
-	_state = state;
+        _state = state;
         _stormConf = stormConf;
 
         String jsonTopologyId = null;
@@ -63,13 +67,13 @@ public class PartitionManager {
 
         if(!topologyInstanceId.equals(jsonTopologyId) && spoutConfig.forceFromStart) {
             _committedTo = _consumer.getOffsetsBefore(spoutConfig.topic, id.partition, spoutConfig.startOffsetTime, 1)[0];
-	    LOG.info("Using startOffsetTime to choose last commit offset.");
+            LOG.info("Using startOffsetTime to choose last commit offset.");
         } else if(jsonTopologyId == null || jsonOffset == null) { // failed to parse JSON?
-            _committedTo = _consumer.getOffsetsBefore(spoutConfig.topic, id.partition, -1, 1)[0];
-	    LOG.info("Setting last commit offset to HEAD.");
+            _committedTo = _consumer.getOffsetsBefore(spoutConfig.topic, id.partition, OffsetRequest.LatestTime(), 1)[0];
+            LOG.info("Setting last commit offset to HEAD.");
         } else {
             _committedTo = jsonOffset;
-	    LOG.info("Read last commit offset from zookeeper: " + _committedTo);
+            LOG.info("Read last commit offset from zookeeper: " + _committedTo);
         }
 
         LOG.info("Starting Kafka " + _consumer.host() + ":" + id.partition + " from offset " + _committedTo);
@@ -78,7 +82,14 @@ public class PartitionManager {
 
     //returns false if it's reached the end of current batch
     public EmitState next(SpoutOutputCollector collector) {
-        if(_waitingToEmit.isEmpty()) fill();
+        if(_waitingToEmit.isEmpty()){
+            try{
+                fill();
+            }catch(IOException ex){
+                LOG.error("Unable to communicate with a kafka partition: ", ex);
+                return EmitState.NO_EMITTED;
+            }
+        }
         while(true) {
             MessageAndRealOffset toEmit = _waitingToEmit.pollFirst();
             if(toEmit==null) {
@@ -100,15 +111,43 @@ public class PartitionManager {
         }
     }
 
-    private void fill() {
+    private void fill() throws IOException{
         //LOG.info("Fetching from Kafka: " + _consumer.host() + ":" + _partition.partition + " from offset " + _emittedToOffset);
-        ByteBufferMessageSet msgs = _consumer.fetch(
-                new FetchRequest(
-                    _spoutConfig.topic,
-                    _partition.partition,
-                    _emittedToOffset,
-                    _spoutConfig.fetchSizeBytes));
-        int numMessages = msgs.underlying().size();
+        ByteBufferMessageSet msgs;
+        int numMessages = 0;
+        msgs = _consumer.fetch(new FetchRequest(_spoutConfig.topic,
+                                                _partition.partition,
+                                                _emittedToOffset,
+                                                _spoutConfig.fetchSizeBytes));
+
+        try{
+            numMessages = msgs.underlying().size();
+        }catch(Throwable ex){
+            msgs = new ByteBufferMessageSet(msgs.getBuffer(), msgs.getInitialOffset(), ErrorMapping.codeFor((Class<Throwable>)ex.getClass()));
+        }
+
+        if(msgs.getErrorCode() != ErrorMapping.NoError()){
+            long[] offsets = _consumer.getOffsetsBefore(_spoutConfig.topic, _partition.partition, _spoutConfig.startOffsetTime, 1);
+
+            if(offsets!=null && offsets.length > 0)
+                _emittedToOffset = offsets[0];
+            else
+                _emittedToOffset = 0L;
+
+            msgs = _consumer.fetch(new FetchRequest(_spoutConfig.topic,
+                                                    _partition.partition,
+                                                    _emittedToOffset,
+                                                    _spoutConfig.fetchSizeBytes));
+
+            numMessages = msgs.underlying().size();
+
+            ErrorMapping.maybeThrowException(msgs.getErrorCode());
+
+        }
+
+
+
+
         if(numMessages>0) {
           LOG.info("Fetched " + numMessages + " messages from Kafka: " + _consumer.host() + ":" + _partition.partition);
         }
@@ -121,6 +160,7 @@ public class PartitionManager {
           LOG.info("Added " + numMessages + " messages from Kafka: " + _consumer.host() + ":" + _partition.partition + " to internal buffers");
         }
     }
+
 
     public void ack(Long offset) {
         _pending.remove(offset);
@@ -154,7 +194,7 @@ public class PartitionManager {
                 .put("broker", ImmutableMap.of("host", _partition.host.host,
                                                "port", _partition.host.port))
                 .put("topic", _spoutConfig.topic).build();
-	    _state.writeJSON(committedPath(), data);
+            _state.writeJSON(committedPath(), data);
 
             LOG.info("Wrote committed offset to ZK: " + committedTo);
             _committedTo = committedTo;
